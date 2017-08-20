@@ -1,13 +1,15 @@
 import hashlib
 import json
 import os
+import datetime
 
 from flask import current_app as app, render_template, request, redirect, jsonify, url_for, Blueprint, \
-    abort, render_template_string
+    abort, render_template_string, send_file
 from passlib.hash import bcrypt_sha256
 from sqlalchemy.sql import not_
+from sqlalchemy.exc import IntegrityError
 
-from CTFd.utils import admins_only, is_admin, cache
+from CTFd.utils import admins_only, is_admin, cache, export_ctf, import_ctf
 from CTFd.models import db, Teams, Solves, Awards, Containers, Challenges, WrongKeys, Keys, Tags, Files, Tracking, Pages, Config, DatabaseError
 from CTFd.scoreboard import get_standings
 from CTFd.plugins.keys import get_key_class, KEY_CLASSES
@@ -40,12 +42,51 @@ def admin_plugin_config(plugin):
     if request.method == 'GET':
         if plugin in utils.get_configurable_plugins():
             config = open(os.path.join(app.root_path, 'plugins', plugin, 'config.html')).read()
-            return render_template('admin/page.html', content=config)
+            return render_template_string(config)
         abort(404)
     elif request.method == 'POST':
         for k, v in request.form.items():
+            if k == "nonce":
+                continue
             utils.set_config(k, v)
+        with app.app_context():
+            cache.clear()
         return '1'
+
+
+@admin.route('/admin/import', methods=['GET', 'POST'])
+@admins_only
+def admin_import_ctf():
+    backup = request.files['backup']
+    segments = request.form.get('segments')
+    errors = []
+    try:
+        if segments:
+            import_ctf(backup, segments=segments.split(','))
+        else:
+            import_ctf(backup)
+    except Exception as e:
+        print(e)
+        errors.append(type(e).__name__)
+
+    if errors:
+        return errors[0], 500
+    else:
+        return redirect(url_for('admin.admin_config'))
+
+
+@admin.route('/admin/export', methods=['GET', 'POST'])
+@admins_only
+def admin_export_ctf():
+    segments = request.args.get('segments')
+    if segments:
+        backup = export_ctf(segments.split(','))
+    else:
+        backup = export_ctf()
+    ctf_name = utils.ctf_name()
+    day = datetime.datetime.now().strftime("%Y-%m-%d")
+    full_name = "{}.{}.zip".format(ctf_name, day)
+    return send_file(backup, as_attachment=True, attachment_filename=full_name)
 
 
 @admin.route('/admin/config', methods=['GET', 'POST'])
@@ -54,10 +95,13 @@ def admin_config():
     if request.method == "POST":
         start = None
         end = None
+        freeze = None
         if request.form.get('start'):
             start = int(request.form['start'])
         if request.form.get('end'):
             end = int(request.form['end'])
+        if request.form.get('freeze'):
+            freeze = int(request.form['freeze'])
 
         try:
             view_challenges_unregistered = bool(request.form.get('view_challenges_unregistered', None))
@@ -69,6 +113,7 @@ def admin_config():
             verify_emails = bool(request.form.get('verify_emails', None))
             mail_tls = bool(request.form.get('mail_tls', None))
             mail_ssl = bool(request.form.get('mail_ssl', None))
+            mail_useauth = bool(request.form.get('mail_useauth', None))
         except (ValueError, TypeError):
             view_challenges_unregistered = None
             view_scoreboard_if_authed = None
@@ -79,6 +124,7 @@ def admin_config():
             verify_emails = None
             mail_tls = None
             mail_ssl = None
+            mail_useauth = None
         finally:
             view_challenges_unregistered = utils.set_config('view_challenges_unregistered', view_challenges_unregistered)
             view_scoreboard_if_authed = utils.set_config('view_scoreboard_if_authed', view_scoreboard_if_authed)
@@ -89,6 +135,7 @@ def admin_config():
             verify_emails = utils.set_config('verify_emails', verify_emails)
             mail_tls = utils.set_config('mail_tls', mail_tls)
             mail_ssl = utils.set_config('mail_ssl', mail_ssl)
+            mail_useauth = utils.set_config('mail_useauth', mail_useauth)
 
         mail_server = utils.set_config("mail_server", request.form.get('mail_server', None))
         mail_port = utils.set_config("mail_port", request.form.get('mail_port', None))
@@ -102,6 +149,8 @@ def admin_config():
         mailfrom_addr = utils.set_config("mailfrom_addr", request.form.get('mailfrom_addr', None))
         mg_base_url = utils.set_config("mg_base_url", request.form.get('mg_base_url', None))
         mg_api_key = utils.set_config("mg_api_key", request.form.get('mg_api_key', None))
+
+        db_freeze = utils.set_config("freeze", freeze)
 
         db_start = Config.query.filter_by(key='start').first()
         db_start.value = start
@@ -136,9 +185,11 @@ def admin_config():
     view_after_ctf = utils.get_config('view_after_ctf')
     start = utils.get_config('start')
     end = utils.get_config('end')
+    freeze = utils.get_config('freeze')
 
     mail_tls = utils.get_config('mail_tls')
     mail_ssl = utils.get_config('mail_ssl')
+    mail_useauth = utils.get_config('mail_useauth')
 
     view_challenges_unregistered = utils.get_config('view_challenges_unregistered')
     view_scoreboard_if_authed = utils.get_config('view_scoreboard_if_authed')
@@ -157,9 +208,11 @@ def admin_config():
                            ctf_theme_config=ctf_theme,
                            start=start,
                            end=end,
+                           freeze=freeze,
                            hide_scores=hide_scores,
                            mail_server=mail_server,
                            mail_port=mail_port,
+                           mail_useauth=mail_useauth,
                            mail_username=mail_username,
                            mail_password=mail_password,
                            mail_tls=mail_tls,

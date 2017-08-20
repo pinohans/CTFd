@@ -2,22 +2,15 @@ import os
 import re
 
 from flask import current_app as app, render_template, request, redirect, abort, jsonify, url_for, session, Blueprint, Response, send_file
+from flask.helpers import safe_join
 from jinja2.exceptions import TemplateNotFound
 from passlib.hash import bcrypt_sha256
 
 from CTFd.models import db, Teams, Solves, Awards, Files, Pages
-from CTFd.utils import cache
+from CTFd.utils import cache, markdown
 from CTFd import utils
 
 views = Blueprint('views', __name__)
-
-
-@views.before_request
-def redirect_setup():
-    if request.path.startswith("/static"):
-        return
-    if not utils.is_setup() and request.path != "/setup":
-        return redirect(url_for('views.setup'))
 
 
 @views.route('/setup', methods=['GET', 'POST'])
@@ -45,22 +38,27 @@ def setup():
 
             # Index page
             page = Pages('index', """<div class="container main-container">
-    <img class="logo" src="{0}/static/original/img/logo.png" />
+    <img class="logo" src="themes/original/static/img/logo.png" />
     <h3 class="text-center">
-        Welcome to a cool CTF framework written by <a href="https://github.com/ColdHeat">Kevin Chung</a> of <a href="https://github.com/isislab">@isislab</a>
+        <p>A cool CTF platform from <a href="https://ctfd.io">ctfd.io</a></p>
+        <p>Follow us on social media:</p>
+        <a href="https://twitter.com/ctfdio"><i class="fa fa-twitter fa-2x" aria-hidden="true"></i></a>&nbsp;
+        <a href="https://facebook.com/ctfdio"><i class="fa fa-facebook-official fa-2x" aria-hidden="true"></i></a>&nbsp;
+        <a href="https://github.com/ctfd"><i class="fa fa-github fa-2x" aria-hidden="true"></i></a>
     </h3>
-
+    <br>
     <h4 class="text-center">
-        <a href="{0}/admin">Click here</a> to login and setup your CTF
+        <a href="admin">Click here</a> to login and setup your CTF
     </h4>
 </div>""".format(request.script_root))
 
             # max attempts per challenge
-            max_tries = utils.set_config("max_tries", 0)
+            max_tries = utils.set_config('max_tries', 0)
 
             # Start time
             start = utils.set_config('start', None)
             end = utils.set_config('end', None)
+            freeze = utils.set_config('freeze', None)
 
             # Challenges cannot be viewed by unregistered users
             view_challenges_unregistered = utils.set_config('view_challenges_unregistered', None)
@@ -77,6 +75,7 @@ def setup():
             mail_ssl = utils.set_config('mail_ssl', None)
             mail_username = utils.set_config('mail_username', None)
             mail_password = utils.set_config('mail_password', None)
+            mail_useauth = utils.set_config('mail_useauth', None)
 
             setup = utils.set_config('setup', True)
 
@@ -102,7 +101,7 @@ def setup():
 # Custom CSS handler
 @views.route('/static/user.css')
 def custom_css():
-    return Response(utils.get_config("css"), mimetype='text/css')
+    return Response(utils.get_config('css'), mimetype='text/css')
 
 
 # Static HTML files
@@ -113,7 +112,7 @@ def static_html(template):
         return render_template('%s.html' % template)
     except TemplateNotFound:
         page = Pages.query.filter_by(route=template).first_or_404()
-        return render_template('page.html', content=page.html)
+        return render_template('page.html', content=markdown(page.html))
 
 
 @views.route('/teams', defaults={'page': '1'})
@@ -139,11 +138,23 @@ def team(teamid):
     if utils.get_config('view_scoreboard_if_utils.authed') and not utils.authed():
         return redirect(url_for('auth.login', next=request.path))
     errors = []
+    freeze = utils.get_config('freeze')
     user = Teams.query.filter_by(id=teamid).first_or_404()
     solves = Solves.query.filter_by(teamid=teamid)
-    awards = Awards.query.filter_by(teamid=teamid).all()
-    score = user.score()
+    awards = Awards.query.filter_by(teamid=teamid)
+
     place = user.place()
+    score = user.score()
+
+    if freeze:
+        freeze = utils.unix_time_to_utc(freeze)
+        if teamid != session.get('id'):
+            solves = solves.filter(Solves.date < freeze)
+            awards = awards.filter(Awards.date < freeze)
+
+    solves = solves.all()
+    awards = awards.all()
+
     db.session.close()
 
     if utils.hide_scores() and teamid != session.get('id'):
@@ -153,7 +164,7 @@ def team(teamid):
         return render_template('team.html', team=user, errors=errors)
 
     if request.method == 'GET':
-        return render_template('team.html', solves=solves, awards=awards, team=user, score=score, place=place)
+        return render_template('team.html', solves=solves, awards=awards, team=user, score=score, place=place, score_frozen=utils.is_scoreboard_frozen())
     elif request.method == 'POST':
         json = {'solves': []}
         for x in solves:
@@ -244,4 +255,13 @@ def file_handler(path):
                 else:
                     abort(403)
     upload_folder = os.path.join(app.root_path, app.config['UPLOAD_FOLDER'])
-    return send_file(os.path.join(upload_folder, f.location))
+    return send_file(safe_join(upload_folder, f.location))
+
+
+@views.route('/themes/<theme>/static/<path:path>')
+def themes_handler(theme, path):
+    filename = safe_join(app.root_path, 'themes', theme, 'static', path)
+    if os.path.isfile(filename):
+        return send_file(filename)
+    else:
+        abort(404)

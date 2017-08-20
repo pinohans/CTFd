@@ -1,6 +1,6 @@
 from flask import current_app as app, render_template, request, redirect, jsonify, url_for, Blueprint
 from CTFd.utils import admins_only, is_admin, cache
-from CTFd.models import db, Teams, Solves, Awards, Containers, Challenges, WrongKeys, Keys, Tags, Files, Tracking, Pages, Config, DatabaseError
+from CTFd.models import db, Teams, Solves, Awards, Unlocks, Containers, Challenges, WrongKeys, Keys, Tags, Files, Tracking, Pages, Config, DatabaseError
 from passlib.hash import bcrypt_sha256
 from sqlalchemy.sql import not_
 
@@ -8,10 +8,32 @@ from CTFd import utils
 
 admin_teams = Blueprint('admin_teams', __name__)
 
+
 @admin_teams.route('/admin/teams', defaults={'page': '1'})
 @admin_teams.route('/admin/teams/<int:page>')
 @admins_only
 def admin_teams_view(page):
+    q = request.args.get('q')
+    if q:
+        field = request.args.get('field')
+        teams = []
+        errors = []
+        if field == 'id':
+            if q.isnumeric():
+                teams = Teams.query.filter(Teams.id == q).order_by(Teams.id.asc()).all()
+            else:
+                teams = []
+                errors.append('Your ID search term is not numeric')
+        elif field == 'name':
+            teams = Teams.query.filter(Teams.name.like('%{}%'.format(q))).order_by(Teams.id.asc()).all()
+        elif field == 'email':
+            teams = Teams.query.filter(Teams.email.like('%{}%'.format(q))).order_by(Teams.id.asc()).all()
+        elif field == 'affiliation':
+            teams = Teams.query.filter(Teams.affiliation.like('%{}%'.format(q))).order_by(Teams.id.asc()).all()
+        elif field == 'country':
+            teams = Teams.query.filter(Teams.country.like('%{}%'.format(q))).order_by(Teams.id.asc()).all()
+        return render_template('admin/teams.html', teams=teams, pages=None, curr_page=None, q=q, field=field)
+
     page = abs(int(page))
     results_per_page = 50
     page_start = results_per_page * (page - 1)
@@ -39,8 +61,8 @@ def admin_team(teamid):
                           .order_by(last_seen.desc()).all()
         wrong_keys = WrongKeys.query.filter_by(teamid=teamid).order_by(WrongKeys.date.asc()).all()
         awards = Awards.query.filter_by(teamid=teamid).order_by(Awards.date.asc()).all()
-        score = user.score()
-        place = user.place()
+        score = user.score(admin=True)
+        place = user.place(admin=True)
         return render_template('admin/team.html', solves=solves, team=user, addrs=addrs, score=score, missing=missing,
                                place=place, wrong_keys=wrong_keys, awards=awards)
     elif request.method == 'POST':
@@ -131,6 +153,8 @@ def unban(teamid):
 @admins_only
 def delete_team(teamid):
     try:
+        Unlocks.query.filter_by(teamid=teamid).delete()
+        Awards.query.filter_by(teamid=teamid).delete()
         WrongKeys.query.filter_by(teamid=teamid).delete()
         Solves.query.filter_by(teamid=teamid).delete()
         Tracking.query.filter_by(team=teamid).delete()
@@ -197,7 +221,7 @@ def admin_fails(teamid):
 @admin_teams.route('/admin/solves/<int:teamid>/<int:chalid>/solve', methods=['POST'])
 @admins_only
 def create_solve(teamid, chalid):
-    solve = Solves(chalid=chalid, teamid=teamid, ip='127.0.0.1', flag='MARKED_AS_SOLVED_BY_ADMIN')
+    solve = Solves(teamid=teamid, chalid=chalid, ip='127.0.0.1', flag='MARKED_AS_SOLVED_BY_ADMIN')
     db.session.add(solve)
     db.session.commit()
     db.session.close()
@@ -223,6 +247,7 @@ def delete_wrong_key(keyid):
     db.session.close()
     return '1'
 
+
 @admin_teams.route('/admin/awards/<int:award_id>/delete', methods=['POST'])
 @admins_only
 def delete_award(award_id):
@@ -231,6 +256,7 @@ def delete_award(award_id):
     db.session.commit()
     db.session.close()
     return '1'
+
 
 @admin_teams.route('/admin/teams/<int:teamid>/awards', methods=['GET'])
 @admins_only

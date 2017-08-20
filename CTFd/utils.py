@@ -1,34 +1,39 @@
+import base64
 import datetime
-import email
 import functools
 import hashlib
 import json
 import logging
 import logging.handlers
+import mistune
 import os
 import re
 import requests
 import shutil
+import six
 import smtplib
 import socket
 import subprocess
 import sys
 import tempfile
 import time
-import urllib
+import dataset
+import zipfile
+import io
 
+from email.mime.text import MIMEText
 from flask import current_app as app, request, redirect, url_for, session, render_template, abort
 from flask_caching import Cache
 from flask_migrate import Migrate, upgrade as migrate_upgrade, stamp as migrate_stamp
-from itsdangerous import Signer
-import six
-from six.moves.urllib.parse import urlparse, urljoin
+from itsdangerous import TimedSerializer, BadTimeSignature, Signer, BadSignature
+from six.moves.urllib.parse import urlparse, urljoin, quote, unquote
 from werkzeug.utils import secure_filename
 
 from CTFd.models import db, WrongKeys, Pages, Config, Tracking, Teams, Files, Containers, ip2long, long2ip
 
 cache = Cache()
 migrate = Migrate()
+markdown = mistune.Markdown()
 
 
 def init_logs(app):
@@ -91,6 +96,7 @@ def init_errors(app):
 
 
 def init_utils(app):
+    app.jinja_env.filters['markdown'] = markdown
     app.jinja_env.filters['unix_time'] = unix_time
     app.jinja_env.filters['unix_time_millis'] = unix_time_millis
     app.jinja_env.filters['long2ip'] = long2ip
@@ -112,7 +118,7 @@ def init_utils(app):
 
     @app.before_request
     def needs_setup():
-        if request.path == '/setup' or request.path.startswith('/static'):
+        if request.path == '/setup' or request.path.startswith('/themes'):
             return
         if not is_setup():
             return redirect(url_for('views.setup'))
@@ -120,7 +126,7 @@ def init_utils(app):
     @app.before_request
     def tracker():
         if authed():
-            track = Tracking.query.filter_by(ip=ip2long(get_ip()), team=session['id']).first()
+            track = Tracking.query.filter_by(ip=get_ip(), team=session['id']).first()
             if not track:
                 visit = Tracking(ip=get_ip(), team=session['id'])
                 db.session.add(visit)
@@ -138,6 +144,10 @@ def init_utils(app):
             if session['nonce'] != request.form.get('nonce'):
                 abort(403)
 
+    @app.before_request
+    def disable_jinja_cache():
+        app.jinja_env.cache = {}
+
 
 @cache.memoize()
 def ctf_name():
@@ -154,6 +164,11 @@ def ctf_theme():
 @cache.memoize()
 def hide_scores():
     return get_config('hide_scores')
+
+
+def override_template(template, html):
+    with app.app_context():
+        app.jinja_loader.overriden_templates[template] = html
 
 
 def pages():
@@ -210,6 +225,17 @@ def admins_only(f):
 @cache.memoize()
 def view_after_ctf():
     return bool(get_config('view_after_ctf'))
+
+
+def is_scoreboard_frozen():
+    freeze = get_config('freeze')
+
+    if freeze:
+        freeze = int(freeze)
+        if freeze < time.time():
+            return True
+
+    return False
 
 
 def ctftime():
@@ -274,6 +300,10 @@ def unix_time_millis(dt):
     return unix_time(dt) * 1000
 
 
+def unix_time_to_utc(t):
+    return datetime.datetime.utcfromtimestamp(t)
+
+
 def get_ip():
     """ Returns the IP address of the currently in scope request. The approach is to define a list of trusted proxies
      (in this case the local network), and only trust the most recently defined untrusted IP address.
@@ -289,7 +319,7 @@ def get_ip():
     combined = "(" + ")|(".join(trusted_proxies) + ")"
     route = request.access_route + [request.remote_addr]
     for addr in reversed(route):
-        if not re.match(combined, addr): # IP is not trusted but we trust the proxies
+        if not re.match(combined, addr):  # IP is not trusted but we trust the proxies
             remote_addr = addr
             break
     else:
@@ -297,13 +327,13 @@ def get_ip():
     return remote_addr
 
 
-def get_kpm(teamid): # keys per minute
+def get_kpm(teamid):  # keys per minute
     one_min_ago = datetime.datetime.utcnow() + datetime.timedelta(minutes=-1)
     return len(db.session.query(WrongKeys).filter(WrongKeys.teamid == teamid, WrongKeys.date >= one_min_ago).all())
 
 
 def get_themes():
-    dir = os.path.join(app.root_path, app.template_folder)
+    dir = os.path.join(app.root_path, 'themes')
     return [name for name in os.listdir(dir)
             if os.path.isdir(os.path.join(dir, name)) and name != 'admin']
 
@@ -330,11 +360,33 @@ def upload_file(file, chalid):
     db_f = Files(chalid, (md5hash + '/' + filename))
     db.session.add(db_f)
     db.session.commit()
+    return db_f.id, (md5hash + '/' + filename)
+
+
+def delete_file(file_id):
+    f = Files.query.filter_by(id=file_id).first_or_404()
+    upload_folder = os.path.join(app.root_path, app.config['UPLOAD_FOLDER'])
+    if os.path.exists(os.path.join(upload_folder, f.location)):  # Some kind of os.path.isfile issue on Windows...
+        os.unlink(os.path.join(upload_folder, f.location))
+    db.session.delete(f)
+    db.session.commit()
     return True
 
 
 @cache.memoize()
 def get_config(key):
+    with app.app_context():
+        value = app.config.get(key)
+        if value:
+            if value and value.isdigit():
+                return int(value)
+            elif value and isinstance(value, six.string_types):
+                if value.lower() == 'true':
+                    return True
+                elif value.lower() == 'false':
+                    return False
+                else:
+                    return value
     config = Config.query.filter_by(key=key).first()
     if config and config.value:
         value = config.value
@@ -384,13 +436,17 @@ def mailserver():
     return False
 
 
-def get_smtp(host, port, username=None, password=None, TLS=None, SSL=None):
-    smtp = smtplib.SMTP(host, port)
-    smtp.ehlo()
+def get_smtp(host, port, username=None, password=None, TLS=None, SSL=None, auth=None):
+    if SSL is None:
+        smtp = smtplib.SMTP(host, port)
+    else:
+        smtp = smtplib.SMTP_SSL(host, port)
+
     if TLS:
         smtp.starttls()
-        smtp.ehlo()
-    smtp.login(username, password)
+
+    if auth:
+        smtp.login(username, password)
     return smtp
 
 
@@ -425,9 +481,11 @@ def sendmail(addr, text):
             data['TLS'] = get_config('mail_tls')
         if get_config('mail_ssl'):
             data['SSL'] = get_config('mail_ssl')
+        if get_config('mail_useauth'):
+            data['auth'] = get_config('mail_useauth')
 
         smtp = get_smtp(**data)
-        msg = email.mime.text.MIMEText(text)
+        msg = MIMEText(text)
         msg['Subject'] = "Message from {0}".format(ctf_name)
         msg['From'] = mailfrom_addr
         msg['To'] = addr
@@ -440,11 +498,12 @@ def sendmail(addr, text):
 
 
 def verify_email(addr):
-    s = Signer(app.config['SECRET_KEY'])
-    token = s.sign(addr)
-    text = """Please click the following link to confirm your email address for {}: {}""".format(
-        get_config('ctf_name'),
-        url_for('auth.confirm_user', _external=True) + '/' + urllib.quote_plus(token.encode('base64'))
+    s = TimedSerializer(app.config['SECRET_KEY'])
+    token = s.dumps(addr)
+    text = """Please click the following link to confirm your email address for {ctf_name}: {url}/{token}""".format(
+        ctf_name=get_config('ctf_name'),
+        url=url_for('auth.confirm_user', _external=True),
+        token=base64encode(token, urlencode=True)
     )
     sendmail(addr, text)
 
@@ -465,6 +524,37 @@ def validate_url(url):
 
 def sha512(string):
     return hashlib.sha512(string).hexdigest()
+
+
+def base64encode(s, urlencode=False):
+    if six.PY3 and isinstance(s, six.string_types):
+        s = s.encode('utf-8')
+    else:
+        # Python 2 support because the base64 module doesnt like unicode
+        s = str(s)
+
+    encoded = base64.urlsafe_b64encode(s)
+    if six.PY3:
+        encoded = encoded.decode('utf-8')
+    if urlencode:
+        encoded = quote(encoded)
+    return encoded
+
+
+def base64decode(s, urldecode=False):
+    if urldecode:
+        s = unquote(s)
+
+    if six.PY3 and isinstance(s, six.string_types):
+        s = s.encode('utf-8')
+    else:
+        # Python 2 support because the base64 module doesnt like unicode
+        s = str(s)
+
+    decoded = base64.urlsafe_b64decode(s)
+    if six.PY3:
+        decoded = decoded.decode('utf-8')
+    return decoded
 
 
 @cache.memoize()
@@ -595,3 +685,187 @@ def container_ports(name, verbose=False):
             return ports
     except subprocess.CalledProcessError:
         return []
+
+
+def export_ctf(segments=None):
+    db = dataset.connect(get_config('SQLALCHEMY_DATABASE_URI'))
+    if segments is None:
+        segments = ['challenges', 'teams', 'both', 'metadata']
+
+    groups = {
+        'challenges': [
+            'challenges',
+            'files',
+            'tags',
+            'keys',
+            'hints',
+        ],
+        'teams': [
+            'teams',
+            'tracking',
+            'awards',
+        ],
+        'both': [
+            'solves',
+            'wrong_keys',
+            'unlocks',
+        ],
+        'metadata': [
+            'alembic_version',
+            'config',
+            'pages',
+            'containers',
+        ]
+    }
+
+    # Backup database
+    backup = io.BytesIO()
+    backup_zip = zipfile.ZipFile(backup, 'w')
+
+    for segment in segments:
+        group = groups[segment]
+        for item in group:
+            result = db[item].all()
+            result_file = io.BytesIO()
+            dataset.freeze(result, format='json', fileobj=result_file)
+            result_file.seek(0)
+            backup_zip.writestr('db/{}.json'.format(item), result_file.read())
+
+    # Backup uploads
+    upload_folder = os.path.join(os.path.normpath(app.root_path), get_config('UPLOAD_FOLDER'))
+    for root, dirs, files in os.walk(upload_folder):
+        for file in files:
+            parent_dir = os.path.basename(root)
+            backup_zip.write(os.path.join(root, file), arcname=os.path.join('uploads', parent_dir, file))
+
+    backup_zip.close()
+    backup.seek(0)
+    return backup
+
+
+def import_ctf(backup, segments=None, erase=False):
+    side_db = dataset.connect(get_config('SQLALCHEMY_DATABASE_URI'))
+    if segments is None:
+        segments = ['challenges', 'teams', 'both', 'metadata']
+
+    if not zipfile.is_zipfile(backup):
+        raise TypeError
+
+    backup = zipfile.ZipFile(backup)
+
+    groups = {
+        'challenges': [
+            'challenges',
+            'files',
+            'tags',
+            'keys',
+            'hints',
+        ],
+        'teams': [
+            'teams',
+            'tracking',
+            'awards',
+        ],
+        'both': [
+            'solves',
+            'wrong_keys',
+            'unlocks',
+        ],
+        'metadata': [
+            'alembic_version',
+            'config',
+            'pages',
+            'containers',
+        ]
+    }
+
+    # Need special handling of metadata
+    if 'metadata' in segments:
+        meta = groups['metadata']
+        segments.remove('metadata')
+        meta.remove('alembic_version')
+
+        for item in meta:
+            table = side_db[item]
+            path = "db/{}.json".format(item)
+            data = backup.open(path).read()
+
+            # Some JSON files will be empty
+            if data:
+                if item == 'config':
+                    saved = json.loads(data)
+                    for entry in saved['results']:
+                        key = entry['key']
+                        value = entry['value']
+                        set_config(key, value)
+
+                elif item == 'pages':
+                    saved = json.loads(data)
+                    for entry in saved['results']:
+                        route = entry['route']
+                        html = entry['html']
+                        page = Pages.query.filter_by(route=route).first()
+                        if page:
+                            page.html = html
+                        else:
+                            page = Pages(route, html)
+                            db.session.add(page)
+                        db.session.commit()
+
+                elif item == 'containers':
+                    saved = json.loads(data)
+                    for entry in saved['results']:
+                        name = entry['name']
+                        buildfile = entry['buildfile']
+                        container = Containers.query.filter_by(name=name).first()
+                        if container:
+                            container.buildfile = buildfile
+                        else:
+                            container = Containers(name, buildfile)
+                            db.session.add(container)
+                        db.session.commit()
+
+    for segment in segments:
+        group = groups[segment]
+        for item in group:
+            table = side_db[item]
+            path = "db/{}.json".format(item)
+            data = backup.open(path).read()
+            if data:
+                saved = json.loads(data)
+                for entry in saved['results']:
+                    entry_id = entry.pop('id', None)
+                    # This is a hack to get SQlite to properly accept datetime values from dataset
+                    # See Issue #246
+                    if get_config('SQLALCHEMY_DATABASE_URI').startswith('sqlite'):
+                        for k, v in entry.items():
+                            if isinstance(v, six.string_types):
+                                try:
+                                    entry[k] = datetime.datetime.strptime(v, '%Y-%m-%dT%H:%M:%S')
+                                except ValueError as e:
+                                    pass
+                    table.insert(entry)
+            else:
+                continue
+
+    # Extracting files
+    files = [f for f in backup.namelist() if f.startswith('uploads/')]
+    upload_folder = app.config.get('UPLOAD_FOLDER')
+    for f in files:
+        filename = f.split(os.sep, 1)
+
+        if len(filename) < 2:  # just an empty uploads directory (e.g. uploads/)
+            continue
+
+        filename = filename[1]  # Get the second entry in the list (the actual filename)
+        full_path = os.path.join(upload_folder, filename)
+        dirname = os.path.dirname(full_path)
+
+        # Create any parent directories for the file
+        if not os.path.exists(dirname):
+            os.makedirs(dirname)
+
+        source = backup.open(f)
+        target = file(full_path, "wb")
+        with source, target:
+            shutil.copyfileobj(source, target)

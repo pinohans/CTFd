@@ -7,6 +7,7 @@ from CTFd import utils
 
 admin_keys = Blueprint('admin_keys', __name__)
 
+
 @admin_keys.route('/admin/key_types', methods=['GET'])
 @admins_only
 def admin_key_types():
@@ -15,6 +16,7 @@ def admin_key_types():
         data[class_id] = KEY_CLASSES.get(class_id).name
 
     return jsonify(data)
+
 
 @admin_keys.route('/admin/keys', defaults={'keyid': None}, methods=['POST', 'GET'])
 @admin_keys.route('/admin/keys/<int:keyid>', methods=['POST', 'GET'])
@@ -45,14 +47,12 @@ def admin_keys_view(keyid):
             db.session.add(k)
         else:
             k = Keys.query.filter_by(id=keyid).first()
-            k.chal = chal
             k.flag = flag
             k.data = data
             k.key_type = key_type
         db.session.commit()
         db.session.close()
         return '1'
-
 
 
 @admin_keys.route('/admin/keys/<int:keyid>/delete', methods=['POST'])
